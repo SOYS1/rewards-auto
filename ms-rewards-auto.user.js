@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Microsoft Rewards 自动助手
 // @namespace    https://github.com/SOYS1/rewards-auto
-// @version      1.1.0
+// @version      1.2.0
 // @description  Bing 搜索与 Rewards 每日任务自动化，内置悬浮面板（搜索积分 / 每日任务 / 连续天数）
 // @author       SOYS1
 // @match        https://www.bing.com/*
@@ -35,7 +35,7 @@
 
   /* ================= 常量与默认配置 ================= */
 
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const STATE_KEY = 'msr:state:v1';
   const SETTINGS_KEY = 'msr:settings:v1';
 
@@ -44,6 +44,14 @@
 
   const CARD_SELECTOR = 'a[data-react-aria-pressable="true"]';
   const SUCCESS_CLASS = 'bg-statusSuccessRewardsBg';
+
+  // 卡片上的「已完成」文案，中英文界面都要认；集中在常量里，避免各处正则各写一份。
+  const DONE_LINE_TEXTS = /^已完成$|^Completed$/i;
+  const DONE_TEXTS = /(^|\n)\s*(已完成|Completed)\s*$/i;
+
+  const PHASES = ['idle', 'daily', 'search', 'search-review', 'done', 'paused', 'error'];
+
+  const PANEL_REFRESH_MS = 10000;   // 面板轮询间隔：够快能看到变化，又不至于把页面拖慢
 
   // 卡片上的导航项，不能当成每日任务。
   const SKIP_PATHS = new Set([
@@ -245,7 +253,7 @@
   /* ================= 状态 ================= */
 
   function emptySearch() {
-    return { done: 0, target: 0, pointsStart: null, pointsLast: null, stall: 0, inFlight: false, lastQuery: '' };
+    return { done: 0, target: 0, pointsStart: null, pointsLast: null, stall: 0, inFlight: false, lastQuery: '', gains: [] };
   }
 
   function createState() {
@@ -258,6 +266,7 @@
       startedAt: 0,
       lastRunAt: 0,
       navCount: 0,
+      navByPhase: {},
       search: emptySearch(),
       scanned: { dashboard: false, earn: false },
       stats: { date: todayKey(), at: 0, today: null, total: null, streak: null, tasks: [], search: { gained: 0, count: 0 } },
@@ -270,11 +279,15 @@
     const saved = readRaw(STATE_KEY);
     const base = createState();
     const next = { ...base, ...(saved || {}) };
+    // 存储里的 version 可能是旧版本号，跑起来之后一律以当前脚本为准。
+    next.version = VERSION;
     next.search = { ...base.search, ...((saved && saved.search) || {}) };
     next.scanned = { ...base.scanned, ...((saved && saved.scanned) || {}) };
     next.stats = { ...base.stats, ...((saved && saved.stats) || {}) };
     next.stats.search = { ...base.stats.search, ...((saved && saved.stats && saved.stats.search) || {}) };
     if (!Array.isArray(next.stats.tasks)) next.stats.tasks = [];
+    next.search.gains = Array.isArray(next.search.gains) ? next.search.gains : [];
+    next.navByPhase = (saved && saved.navByPhase) || {};
     next.tasks = (saved && saved.tasks) || {};
     next.log = (saved && saved.log) || [];
     // 跨天时清掉当天的任务与搜索进度，但保留运行中的会话。
@@ -288,11 +301,22 @@
     target.search = emptySearch();
     target.scanned = { dashboard: false, earn: false };
     target.navCount = 0;
+    target.navByPhase = {};
     if (target.running) target.phase = 'daily';
   }
 
   function loadSettings() {
     return { ...DEFAULT_SETTINGS, ...(readRaw(SETTINGS_KEY) || {}) };
+  }
+
+  // 阶段字符串写错会静默失效（面板一直显示待机、状态机不推进），所以统一从这里改。
+  function setPhase(next) {
+    if (!PHASES.includes(next)) {
+      log(`未知阶段：${next}，已忽略`, 'warn');
+      return false;
+    }
+    state.phase = next;
+    return true;
   }
 
   function persist() {
@@ -405,12 +429,43 @@
       // active / visited 都表示「本次已经访问过」，回到 Rewards 后按访问次数决定重试或放弃。
       if (existing.status === 'visited' || existing.status === 'active') {
         existing.status = existing.attempts >= settings.maxAttemptsPerTask ? 'failed' : 'pending';
+        existing.verifiedAt = now;
       }
     }
   }
 
-  function pickTask() {
-    for (const task of Object.values(state.tasks)) {
+  // 等待卡片渲染到位。有任务「访问过但还没结案」时多等一会儿，
+  // 否则懒加载会让脚本误以为卡片消失了。
+  async function scanCardsSettled() {
+    let cards = scanCards();
+    const watching = Object.values(state.tasks)
+      .filter((task) => task.status === 'active' || task.status === 'visited');
+    const missingNow = () => watching.filter((task) => !cards.some((card) => card.id === task.id));
+
+    if (state.phase !== 'search' && (!cards.length || missingNow().length)) {
+      const settled = await waitFor(() => {
+        const list = scanCards();
+        const stillMissing = watching.filter((task) => !list.some((card) => card.id === task.id));
+        return list.length && !stillMissing.length ? list : null;
+      }, 8000, 500);
+      if (settled) cards = settled;
+    }
+    return { cards, missing: missingNow() };
+  }
+
+  // 等过一轮还是看不到卡片：按尝试次数收尾，别让任务永远卡在 visited。
+  function settleUnseen(tasks) {
+    for (const task of tasks) {
+      const failed = (task.attempts || 0) >= settings.maxAttemptsPerTask;
+      task.status = failed ? 'failed' : 'pending';
+      task.verifiedAt = Date.now();
+      log(failed
+        ? `未能确认任务状态，已放弃（${task.attempts}/${settings.maxAttemptsPerTask}）：${task.title}`
+        : `未能确认任务状态，稍后重试：${task.title}`, 'warn');
+    }
+  }
+
+  function pickTask() {    for (const task of Object.values(state.tasks)) {
       if (task.status !== 'pending') continue;
       if (task.kind === 'quest' && !settings.punchcards) {
         task.status = 'skipped';
@@ -614,14 +669,31 @@
     const stats = state.stats;
     if (!stats.search) stats.search = { gained: 0, count: 0 };
     stats.search.count = (Number(stats.search.count) || 0) + 1;
-    if (gain > 0) stats.search.gained = (Number(stats.search.gained) || 0) + gain;
+    if (!(gain > 0)) return;
+    stats.search.gained = (Number(stats.search.gained) || 0) + attributeSearchGain(gain);
+  }
+
+  // 单次搜索的加分理论上就是 pointsPerSearch。差值偶尔会把同时到账的任务积分算进来，
+  // 超过「正常值 / 历史中位数」两倍时只按一次搜索的额度记账，避免整块虚高。
+  function attributeSearchGain(gain) {
+    const expected = Math.max(1, Number(settings.pointsPerSearch) || 1);
+    const history = state.search.gains || (state.search.gains = []);
+    const sorted = history.slice().sort((a, b) => a - b);
+    const median = sorted.length ? sorted[Math.floor(sorted.length / 2)] : expected;
+    if (gain > Math.max(expected, median) * 2) {
+      log(`本次积分跳变 +${gain}，按单次额度 ${expected} 计入搜索积分`, 'warn');
+      return expected;
+    }
+    history.push(gain);
+    state.search.gains = history.slice(-20);
+    return gain;
   }
 
   function nextSearch() {
     const target = Math.max(0, Number(settings.desktopTarget) || 0);
     state.search.target = target;
     if (state.search.done >= target) {
-      state.phase = 'search-review';
+      setPhase('search-review');
       persist();
       return go(REWARDS_DASHBOARD);
     }
@@ -629,7 +701,7 @@
     if (state.search.pointsStart == null) state.search.pointsStart = readPoints();
     state.search.inFlight = true;
     state.search.lastQuery = query;
-    state.phase = 'search';
+    setPhase('search');
     persist();
     log(`搜索 ${state.search.done + 1}/${target}：${query}`);
     return go('https://www.bing.com/search?q=' + encodeURIComponent(query) + '&form=QBLH', { delay: rand(settings.minDelayMs, settings.maxDelayMs) });
@@ -666,7 +738,7 @@
     const stalled = state.search.stall >= settings.stallAfter && state.search.done >= 8;
     if (done || stalled) {
       if (stalled) log(`连续 ${state.search.stall} 次搜索没有加分，提前收尾`, 'warn');
-      state.phase = 'search-review';
+      setPhase('search-review');
       persist();
       return go(REWARDS_DASHBOARD, { delay: 800 });
     }
@@ -685,7 +757,7 @@
         stats.gained = Math.max(Number(stats.gained) || 0, gained);
       }
     }
-    state.phase = 'done';
+    // finish() 会按 level 把 phase 收成 done，这里不用重复设置。
     return finish('搜索额度已完成');
   }
 
@@ -709,10 +781,15 @@
   function go(url, options = {}) {
     const target = navigationTarget(url);
     if (!target) return finish('目标地址不在白名单内，已中止：' + url, 'error');
-    const delay = options.delay == null ? rand(900, 1800) : options.delay;
+    const phase = state.phase || 'idle';
+    state.navByPhase = state.navByPhase || {};
+    state.navByPhase[phase] = (Number(state.navByPhase[phase]) || 0) + 1;
     state.navCount = (state.navCount || 0) + 1;
     persist();
-    if (state.navCount > 120) return finish('跳转次数过多，已中止', 'error');
+    if (state.navByPhase[phase] > navBudget()) {
+      return finish(`「${phase}」阶段跳转次数异常（${state.navByPhase[phase]}），已中止`, 'error');
+    }
+    const delay = options.delay == null ? rand(900, 1800) : options.delay;
     return sleep(delay).then(() => {
       // 用户可能在等待期间点了停止，此时不再跳转。
       if (!state.running) return;
@@ -725,43 +802,47 @@
     return /验证你(是|不是)人类|请输入验证码|unusual traffic|verify you are human|are you a robot/i.test(text);
   }
 
+  // 每个阶段的跳转预算是有限的：超了说明状态机在原地打转，而不是任务真的多。
+  function navBudget() {
+    const attempts = Math.max(1, Number(settings.maxAttemptsPerTask) || 1);
+    const tasks = Object.keys(state.tasks || {}).length;
+    // 一个任务每轮至少 2 跳（去 + 回），按最大尝试次数留足余量。
+    if (state.phase === 'daily') return Math.max(24, tasks * (attempts + 1) * 2 + 16);
+    if (state.phase === 'search') return Math.max(24, Number(settings.desktopTarget) || 0) + 12;
+    return 12;
+  }
+
+  // 目标是 Rewards 站内的页面（拼图详情 / 活动页）：只停留一下，然后回首页复核。
+  async function visitRewardsTaskPage() {
+    const onInnerPage = location.pathname !== '/dashboard' && location.pathname !== '/earn';
+    const onQuest = location.pathname.includes('/earn/quest/');
+    const task = Object.values(state.tasks).find((candidate) => {
+      if (candidate.status !== 'active') return false;
+      return candidate.kind === 'quest' ? onQuest : onInnerPage;
+    });
+    if (!task) return null;
+    await sleep(rand(1500, 3500));
+    task.status = 'visited';
+    task.completedAt = Date.now();
+    persist();
+    return go(REWARDS_DASHBOARD);
+  }
+
   async function rewardsStep() {
     if (state.phase === 'search-review') return reviewSearches();
     if (state.phase === 'done') return finish('已完成');
 
-    // 落在拼图详情页：只做访问，然后回首页继续。
-    const activeQuest = Object.values(state.tasks).find((task) => task.status === 'active' && task.kind === 'quest');
-    if (activeQuest && location.pathname.includes('/earn/quest/')) {
-      await sleep(rand(2000, 3500));
-      activeQuest.status = 'visited';
-      activeQuest.completedAt = Date.now();
-      persist();
-      return go(REWARDS_DASHBOARD);
-    }
+    // 落在 Rewards 站内的任务页（拼图详情 / 活动页）：只做访问，然后回首页继续。
+    const visited = await visitRewardsTaskPage();
+    if (visited) return visited;
 
-    // 目标是 Rewards 站内的其他页面（非拼图）：同样只做一次访问。
-    const activeInternal = Object.values(state.tasks).find((task) => task.status === 'active' && task.kind !== 'quest');
-    if (activeInternal && location.pathname !== '/dashboard' && location.pathname !== '/earn') {
-      await sleep(rand(1500, 3000));
-      activeInternal.status = 'visited';
-      activeInternal.completedAt = Date.now();
-      persist();
-      return go(REWARDS_DASHBOARD);
-    }
-
-    // React 卡片是懒加载的：首次为空时等一会儿再判断，避免把「还没渲染」当成「没有任务」。
-    let cards = scanCards();
-    if (!cards.length && state.phase !== 'search') {
-      cards = await waitFor(() => {
-        const list = scanCards();
-        return list.length ? list : null;
-      }, 8000, 500) || [];
-    }
+    const { cards, missing } = await scanCardsSettled();
     if (cards.length) syncTasks(cards);
     else log('当前页面没有扫描到任务卡片', 'warn');
+    if (missing.length) settleUnseen(missing);
 
     if (settings.dailySet && state.phase !== 'search') {
-      state.phase = 'daily';
+      setPhase('daily');
       const surface = location.pathname.toLowerCase().startsWith('/earn') ? 'earn' : 'dashboard';
       state.scanned[surface] = true;
       persist();
@@ -787,7 +868,7 @@
 
     if (!settings.searchEnabled) return finish('搜索已在设置中关闭');
 
-    state.phase = 'search';
+    setPhase('search');
     const target = Math.max(0, Number(settings.desktopTarget) || 0);
     if (target === 0) return finish('搜索目标为 0');
     if (state.search.done >= target) return finish('搜索额度已完成');
@@ -811,7 +892,7 @@
   function finish(reason, level = 'info') {
     state.running = false;
     state.stopRequested = false;
-    state.phase = level === 'error' ? 'error' : 'done';
+    setPhase(level === 'error' ? 'error' : 'done');
     state.lastRunAt = Date.now();
     state.search.inFlight = false;
     log(`本次运行结束：${reason}`, level);
@@ -876,14 +957,14 @@
     };
     state.running = true;
     state.stopRequested = false;
-    state.phase = 'daily';
+    setPhase('daily');
     state.startedAt = Date.now();
     state.date = todayKey();
     persist();
 
     if (!isRewardsPage()) {
       log('正在打开 Rewards 面板页');
-      return sleep(600).then(() => location.assign(REWARDS_DASHBOARD));
+      return go(REWARDS_DASHBOARD, { delay: 600 });
     }
     return boot();
   }
@@ -891,7 +972,7 @@
   function stop(reason = '用户手动停止') {
     state.running = false;
     state.stopRequested = true;
-    state.phase = 'paused';
+    setPhase('paused');
     state.search.inFlight = false;
     log(reason, 'warn');
     persist();
@@ -982,34 +1063,40 @@
     :is(button, input):focus-visible { outline: 2px solid #5eb9ff; outline-offset: 3px; }
     .panel-body { display: block; }
     .is-collapsed .panel-body { display: none; }
-    .summary { display: grid; grid-template-columns: 1fr 6.5rem; gap: 1rem; align-items: center; padding: 1.2rem 1rem .9rem; }
-    .summary-copy small { color: var(--muted); font-size: .72rem; }
-    .summary-copy strong { display: block; margin: .15rem 0 .15rem; font-size: 2.25rem; line-height: 1.08; letter-spacing: -.04em; }
-    .summary-copy .delta { color: var(--muted); font-size: .73rem; }
-    .ring-wrap { position: relative; display: grid; place-items: center; width: 6.5rem; height: 6.5rem; }
+    /* 主卡：左边是搜索积分（脚本的核心产出），右边小环形是每日任务完成度。 */
+    .hero { display: grid; grid-template-columns: minmax(0, 1fr) 5.4rem; gap: .9rem; align-items: center; margin: 0 1rem .55rem; padding: .95rem 1rem 1rem; border: 1px solid rgba(94, 185, 255, .26); border-radius: 17px; background: linear-gradient(150deg, rgba(39, 137, 232, .2), rgba(94, 185, 255, .03)); }
+    .hero-main { min-width: 0; }
+    .hero-head { display: flex; align-items: center; justify-content: space-between; gap: .4rem; }
+    .hero-title { display: flex; align-items: center; gap: .35rem; color: #dbeaff; font-size: .75rem; font-weight: 600; white-space: nowrap; }
+    .hero-title svg { width: .85rem; height: .85rem; color: var(--blue); }
+    .hero-cap { color: var(--muted); font-size: .64rem; white-space: nowrap; }
+    .hero-value { display: flex; align-items: baseline; gap: .28rem; margin: .34rem 0 .48rem; }
+    .hero-value strong { font-size: 2.05rem; line-height: 1; letter-spacing: -.045em; }
+    .hero-value em { color: var(--muted); font-size: .8rem; font-style: normal; }
+    .search-bar { height: .4rem; overflow: hidden; border-radius: 99px; background: rgba(126, 162, 202, .16); }
+    .search-bar i { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--blue-strong), var(--blue)); transition: width .35s ease; }
+    /* 搜索阶段的流动条：告诉用户「还在跑」，而不是卡住了。prefers-reduced-motion 下由媒体查询统一关掉。 */
+    .hero.is-running .search-bar i { background-image: linear-gradient(90deg, var(--blue-strong), var(--blue), var(--blue-strong)); background-size: 200% 100%; animation: msr-flow 2.4s linear infinite; }
+    @keyframes msr-flow { to { background-position: -200% 0; } }
+    .hero-meta { display: flex; justify-content: space-between; gap: .5rem; margin-top: .42rem; color: var(--muted); font-size: .64rem; }
+    .hero.is-complete { border-color: rgba(109, 225, 177, .32); background: linear-gradient(150deg, rgba(53, 169, 127, .2), rgba(109, 225, 177, .03)); }
+    .hero.is-complete .search-bar i { background-image: linear-gradient(90deg, #35a97f, var(--green)); animation: none; }
+    .hero-ring { position: relative; display: grid; place-items: center; width: 5.4rem; height: 5.4rem; }
     .ring { width: 100%; height: 100%; transform: rotate(-90deg); }
     .ring-track, .ring-value { fill: none; stroke-width: 9; }
     .ring-track { stroke: rgba(126, 162, 202, .15); }
     .ring-value { stroke: var(--blue); stroke-linecap: round; transition: stroke-dashoffset .35s ease; }
     .ring-center { position: absolute; text-align: center; }
     .ring-center strong, .ring-center span { display: block; }
-    .ring-center strong { font-size: 1.25rem; line-height: 1; }
-    .ring-center span { margin-top: .22rem; color: var(--muted); font-size: .62rem; }
-    .search-card { margin: 0 1rem 1rem; padding: .82rem .85rem .78rem; border: 1px solid rgba(94, 185, 255, .26); border-radius: 15px; background: linear-gradient(150deg, rgba(39, 137, 232, .18), rgba(94, 185, 255, .03)); }
-    .search-head { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
-    .search-title { display: flex; align-items: center; gap: .35rem; font-size: .75rem; font-weight: 600; color: #dbeaff; }
-    .search-title svg { width: .85rem; height: .85rem; color: var(--blue); }
-    .search-cap { color: var(--muted); font-size: .66rem; white-space: nowrap; }
-    .search-value { display: flex; align-items: baseline; gap: .3rem; margin: .42rem 0 .5rem; }
-    .search-value strong { font-size: 1.5rem; line-height: 1; letter-spacing: -.03em; }
-    .search-value em { color: var(--muted); font-size: .75rem; font-style: normal; }
-    .search-bar { height: .38rem; overflow: hidden; border-radius: 99px; background: rgba(126, 162, 202, .16); }
-    .search-bar i { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--blue-strong), var(--blue)); transition: width .35s ease; }
-    .search-card.is-complete { border-color: rgba(109, 225, 177, .32); background: linear-gradient(150deg, rgba(53, 169, 127, .18), rgba(109, 225, 177, .03)); }
-    .search-card.is-complete .search-bar i { background: linear-gradient(90deg, #35a97f, var(--green)); }
-    .search-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .2rem .6rem; margin-top: .45rem; color: var(--muted); font-size: .66rem; }
-    .search-meta .search-remain { color: var(--blue); }
-    .search-card.is-complete .search-meta .search-remain { color: var(--green); }
+    .ring-center strong { font-size: 1.05rem; line-height: 1; }
+    .ring-center span { margin-top: .18rem; color: var(--muted); font-size: .58rem; }
+    .hero-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .2rem .6rem; margin: 0 1rem .9rem; color: var(--muted); font-size: .66rem; }
+    .hero-today b { color: #edf5ff; font-weight: 600; }
+    .hero-foot .search-remain { color: var(--blue); }
+    .hero-foot.is-complete .search-remain { color: var(--green); }
+    .hero-updated { flex-basis: 100%; color: rgba(142, 164, 193, .72); font-size: .62rem; }
+    .mini-progress { display: none; margin-left: auto; padding: .1rem .45rem; border-radius: 99px; background: rgba(94, 185, 255, .14); color: var(--blue); font-size: .66rem; font-variant-numeric: tabular-nums; }
+    .is-collapsed .mini-progress { display: inline-block; }
     .task-segments { padding: 0 1rem 1rem; }
     .task-segments-title { display: flex; justify-content: space-between; margin-bottom: .42rem; color: var(--muted); font-size: .68rem; }
     .segment-track { display: grid; grid-template-columns: repeat(6, 1fr); gap: .3rem; min-height: .35rem; }
@@ -1043,6 +1130,12 @@
     .icon-button.spinning svg { animation: msr-spin .6s linear; }
     @media (max-width: 620px) {
       .capsule { left: 1rem !important; top: auto !important; bottom: 1rem; width: calc(100vw - 2rem); border-radius: 18px; max-height: calc(100dvh - 2rem); overflow-y: auto; }
+      /* 窄屏下环形缩一圈，给「搜索积分 / 上限」留出可读宽度。 */
+      .hero { grid-template-columns: minmax(0, 1fr) 4.6rem; gap: .7rem; padding: .85rem .85rem .9rem; }
+      .hero-ring { width: 4.6rem; height: 4.6rem; }
+      .hero-value strong { font-size: 1.8rem; }
+      .hero-cap { font-size: .6rem; }
+      .brand-copy span { display: none; }
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { transition-duration: 0s !important; animation-duration: 0s !important; }
@@ -1055,7 +1148,8 @@
         <span class="brand-mark" aria-hidden="true">
           <svg viewBox="0 0 32 32" fill="none"><path d="M7 5h8.2v8.2H7V5Zm9.8 0H25v8.2h-8.2V5ZM7 14.8h8.2V23H7v-8.2Zm9.8 0H25V23h-8.2v-8.2Z" fill="currentColor"/><path d="M7 24.8h8.2V27H7v-2.2Zm9.8 0H25V27h-8.2v-2.2Z" fill="currentColor" opacity=".72"/></svg>
         </span>
-        <div class="brand-copy"><strong>Rewards Assistant</strong><span>今日积分概览</span></div>
+        <div class="brand-copy"><strong>Rewards Assistant</strong><span>搜索积分与每日任务</span></div>
+        <span class="mini-progress" id="miniProgress" aria-hidden="true">--</span>
         <div class="header-actions">
           <button class="drag-handle" id="dragHandle" type="button" aria-label="移动面板" title="拖拽移动面板">
             <svg viewBox="0 0 16 16" fill="currentColor"><circle cx="5" cy="4" r="1"/><circle cx="11" cy="4" r="1"/><circle cx="5" cy="8" r="1"/><circle cx="11" cy="8" r="1"/><circle cx="5" cy="12" r="1"/><circle cx="11" cy="12" r="1"/></svg>
@@ -1069,38 +1163,39 @@
         </div>
       </header>
       <div class="panel-body">
-        <section class="summary">
-          <div class="summary-copy">
-            <small>今日已获得积分</small>
-            <strong id="todayPoints">--</strong>
-            <span class="delta" id="deltaText">等待 Rewards 数据</span>
+        <section class="hero" id="searchCard">
+          <div class="hero-main">
+            <div class="hero-head">
+              <span class="hero-title">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></svg>必应搜索
+              </span>
+              <span class="hero-cap" id="searchCapLabel">每日上限 -- 积分</span>
+            </div>
+            <div class="hero-value">
+              <strong id="searchPoints">+0</strong>
+              <em id="searchCapValue">/ --</em>
+            </div>
+            <div class="search-bar" id="searchBarTrack" role="progressbar" aria-label="今日搜索积分进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <i id="searchBar"></i>
+            </div>
+            <div class="hero-meta">
+              <span id="searchCount">已完成 0 次</span>
+              <span id="searchRate">每次搜索 +3 积分</span>
+            </div>
           </div>
-          <div class="ring-wrap">
-            <svg class="ring" viewBox="0 0 100 100" role="progressbar" aria-label="每日任务完成度" aria-valuemin="0" aria-valuemax="100">
+          <div class="hero-ring">
+            <svg class="ring" id="taskRing" viewBox="0 0 100 100" role="progressbar" aria-label="每日任务完成度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
               <circle class="ring-track" cx="50" cy="50" r="42"></circle>
               <circle class="ring-value" id="ringValue" cx="50" cy="50" r="42" pathLength="100"></circle>
             </svg>
             <div class="ring-center"><strong id="progressText">--</strong><span>每日任务</span></div>
           </div>
         </section>
-        <section class="search-card" id="searchCard">
-          <div class="search-head">
-            <span class="search-title">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></svg>必应搜索
-            </span>
-            <span class="search-cap" id="searchCapLabel">每日上限 -- 积分</span>
-          </div>
-          <div class="search-value">
-            <strong id="searchPoints">+0</strong>
-            <em id="searchCapValue">/ --</em>
-          </div>
-          <div class="search-bar"><i id="searchBar"></i></div>
-          <div class="search-meta">
-            <span id="searchCount">已完成 0 次</span>
-            <span id="searchRate">每次搜索 +3 积分</span>
-            <span class="search-remain" id="searchRemain"></span>
-          </div>
-        </section>
+        <div class="hero-foot" id="heroFoot">
+          <span class="hero-today">今日已获得 <b id="todayPoints">--</b></span>
+          <span class="search-remain" id="searchRemain"></span>
+          <span class="hero-updated" id="deltaText">等待 Rewards 数据</span>
+        </div>
         <section class="task-segments">
           <div class="task-segments-title"><span>任务分段</span><span id="taskCount">等待扫描</span></div>
           <div class="segment-track" id="segmentTrack"></div>
@@ -1122,7 +1217,7 @@
       </div>
       <footer class="footer">
         <div class="status"><i class="status-dot" id="statusDot"></i><span id="statusText">待机中</span></div>
-        <label class="switch"><span>自动运行</span><input id="enabledInput" type="checkbox"><span class="track" aria-hidden="true"></span></label>
+        <label class="switch"><span>自动运行</span><input id="enabledInput" type="checkbox" role="switch" aria-checked="false"><span class="track" aria-hidden="true"></span></label>
       </footer>
     </div>
   `;
@@ -1163,7 +1258,9 @@
     }
 
     if (isRewardsPage()) {
-      const text = (document.body && document.body.innerText) || '';
+      // 只读主区域：整页 innerText 在长列表上会触发很贵的 layout。
+      const region = document.querySelector('main, [role="main"]') || document.body;
+      const text = (region && region.innerText) || '';
       const today = matchPoints(text, TEXT_PATTERNS.today);
       const total = matchPoints(text, TEXT_PATTERNS.available);
       const streak = matchPoints(text, TEXT_PATTERNS.streak);
@@ -1208,7 +1305,9 @@
     if (state.running) {
       if (state.phase === 'daily') return { key: 'refreshing', text: '正在处理每日任务' };
       if (state.phase === 'search') {
-        return { key: 'refreshing', text: '自动搜索 ' + state.search.done + '/' + (state.search.target || settings.desktopTarget) };
+        const target = Number(state.search.target) || Number(settings.desktopTarget) || 0;
+        if (!target) return { key: 'refreshing', text: '自动搜索中' };
+        return { key: 'refreshing', text: '第 ' + Math.min(state.search.done + 1, target) + '/' + target + ' 次搜索中' };
       }
       if (state.phase === 'search-review') return { key: 'refreshing', text: '复核积分' };
       return { key: 'refreshing', text: '运行中' };
@@ -1250,13 +1349,20 @@
       : '已完成 ' + searchDone + ' 次';
     $('#searchRemain').textContent = cap <= 0
       ? ''
-      : (searchShown >= cap ? '今日搜索积分已满' : '还差 ' + (cap - searchShown) + ' 积分');
-    $('#searchCard').classList.toggle('is-complete', cap > 0 && searchShown >= cap);
+      : (searchShown >= cap ? '今日搜索积分已满 · 明天 0 点重置' : '还差 ' + (cap - searchShown) + ' 积分');
+    const doneToday = cap > 0 && searchShown >= cap;
+    $('#searchCard').classList.toggle('is-complete', doneToday);
+    $('#heroFoot').classList.toggle('is-complete', doneToday);
+    // 搜索阶段给进度条一点「在跑」的反馈，停下来就恢复静态渐变。
+    $('#searchCard').classList.toggle('is-running', Boolean(state.running) && state.phase === 'search' && !doneToday);
+    $('#miniProgress').textContent = cap > 0 ? searchShown + '/' + cap : '--';
+    $('#searchBarTrack').setAttribute('aria-valuenow', String(cap > 0 ? Math.round((searchShown / cap) * 100) : 0));
 
     const ringValue = $('#ringValue');
     ringValue.style.strokeDasharray = '100';
     ringValue.style.strokeDashoffset = String(100 - percent);
     $('#progressText').textContent = total ? percent + '%' : '--';
+    $('#taskRing').setAttribute('aria-valuenow', String(percent));
 
     $('#taskCount').textContent = total ? completed + ' / ' + total : '等待扫描';
     const track = $('#segmentTrack');
@@ -1276,6 +1382,7 @@
     $('#statusText').textContent = status.text;
     $('#statusDot').dataset.status = status.key;
     $('#enabledInput').checked = Boolean(state.running);
+    $('#enabledInput').setAttribute('aria-checked', String(Boolean(state.running)));
     const lastLog = (state.log || [])[state.log.length - 1];
     panelCapsule.title = lastLog ? lastLog.message : '';
   }
@@ -1374,10 +1481,17 @@
     refreshStats();
 
     // SPA 路由（Rewards 站内点击导航）不会重新加载脚本，靠轮询补充刷新。
-    setInterval(() => {
+    // 10 秒一轮、后台标签页直接跳过：innerText 和卡片全扫都会触发 layout，没必要 5 秒做一次。
+    const tick = () => {
+      if (document.hidden) return;
       refreshStats();
       renderPanel();
-    }, 5000);
+    };
+    setInterval(tick, PANEL_REFRESH_MS);
+    // 从后台切回来时立刻补一次，避免看到十几秒前的数字。
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) tick();
+    });
   }
 
   window.MSRewards = api();

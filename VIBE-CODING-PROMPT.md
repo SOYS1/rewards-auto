@@ -25,11 +25,13 @@ React 站点的 DOM 逆向、Shadow DOM 样式隔离，以及「页面会随时�
 | --- | --- |
 | 存储 | `readRaw` / `writeRaw`（`GM_getValue` 优先，回退 `localStorage`），`STATE_KEY` / `SETTINGS_KEY` / `PANEL_KEY` |
 | 全局状态 | `state`（`running` / `phase` / `date` / `search` / `scanned` / `stats` / `tasks` / `log`），`createState()` / `loadState()` / `persist()` / `publicState()` |
-| 阶段流转 | `idle → daily → search → search-review → done`，另有 `paused`（用户停止）与 `error` |
+| 阶段流转 | `idle → daily → search → search-review → done`，另有 `paused`（用户停止）与 `error`；一律通过 `setPhase()` 改 |
 | 入口 | `boot()` → `rewardsStep()` / `bingStep()` / `runTaskPage()` |
-| 唯一跳转出口 | `go(url)`，内部先过 `navigationTarget()` 白名单校验 |
-| 选择器与文案 | 文件顶部常量区：`CARD_SELECTOR`、`SKIP_PATHS`、`TASK_HOSTS`、`NEXT_TEXTS`、`OPTION_SELECTOR`、`TEXT_PATTERNS` |
-| 面板 | `PANEL_CSS` + `PANEL_HTML` + `mountPanel()` / `renderPanel()` / `bindPanelEvents()`，`refreshStats()` 每 5 秒轮询 |
+| 唯一跳转出口 | `go(url)`，内部先过 `navigationTarget()` 白名单校验，再按 `navBudget()` 的阶段性预算计数 |
+| 任务复核 | `scanCards()` → `scanCardsSettled()`（等懒加载）→ `syncTasks()` / `settleUnseen()` |
+| 搜索计分 | `searchCap()`（上限 = 次数 × 每次积分）、`addSearchPoints()`、`attributeSearchGain()`（异常值折算） |
+| 选择器与文案 | 文件顶部常量区：`CARD_SELECTOR`、`SKIP_PATHS`、`TASK_HOSTS`、`NEXT_TEXTS`、`OPTION_SELECTOR`、`TEXT_PATTERNS`、`DONE_TEXTS` |
+| 面板 | `PANEL_CSS` + `PANEL_HTML` + `mountPanel()` / `renderPanel()` / `bindPanelEvents()`，`refreshStats()` 每 `PANEL_REFRESH_MS`（10 秒）轮询，后台标签页跳过 |
 | 对外 API | `window.MSRewards = { version, start, stop, configure, getSettings, getState, isRunning, subscribe }` |
 
 核心模型是「单标签页状态机」：脚本跟随页面跳转，每次加载从存储恢复状态、只推进一步，然后跳走。
@@ -47,44 +49,45 @@ React 站点的 DOM 逆向、Shadow DOM 样式隔离，以及「页面会随时�
 7. 不新增会消耗用户积分的操作（兑换、抽奖、购买）——任何情况都不自动点击。
 8. 向后兼容：`getState()` 可以加字段，不能删字段或改字段含义；旧存储数据必须能正常加载。
 
-## 本轮目标
+## 进度（v1.2.0 已交付，别再重做）
 
-### P0 · 稳定性
+- P0-1 任务复核：已加 `scanCardsSettled()`（等待卡片渲染）+ `settleUnseen()`（等过一轮仍看不到卡片时按尝试次数收尾）。
+- P0-2 搜索积分高估：已加 `attributeSearchGain()`，差值超过「配置值 / 历史中位数」两倍时只按 `pointsPerSearch` 记账。
+- P0-3 跳转阈值：已改为 `navBudget()` 按阶段计算，`state.navByPhase` 分开计数。
+- P1 面板：summary 与搜索区块已合并为一张主卡（左：搜索积分 + 进度条；右：任务小环形），
+  搜索阶段有流动条动画、底栏显示「第 N/30 次搜索中」、打满变绿并提示「明天 0 点重置」、
+  折叠后仍显示 `45/90` 迷你进度；进度条与开关补了 ARIA；轮询 10 秒 + 跳过后台标签页 + 只读 `main` 区域。
+- P2：`visitRewardsTaskPage()` 已合掉重复分支；`DONE_TEXTS` / `DONE_LINE_TEXTS` 已集中；`setPhase()` 已加校验。
+- `start()` 里最后一处裸 `location.assign` 也已改用 `go()`，现在全仓库只有 `go()` 会导航。
 
-- `syncTasks()` 的 `attempts` 判定：任务「访问过但未完成」时依赖回到 Rewards 后的卡片状态，
-  如果卡片是懒加载，可能在本轮被误判 `failed`。请给出更稳的复核策略（例如二次 `waitFor` + 仅在同一次运行内重试）。
-- `onSearchResult()` 的 `pointsLast` 差值在「积分被其他来源同时增加」时会高估搜索积分。
-  现在的兜底是 `reviewSearches()` 取整段差值。请评估是否需要用「每次搜索后的增量中位数」做异常值剔除。
-- `state.navCount > 120` 的硬阈值在任务很多时可能误伤，请改成「按阶段限量」而不是全局限量。
+## 下一轮目标
 
-### P1 · 面板 UI（重点）
+### P0 · 稳定性（剩余）
 
-现状：header → 今日积分 + 环形任务进度 → **必应搜索** → 任务分段 → 每日任务 → 连续天数/总积分 → 底栏开关。
+- `stats.search.count` 是逐次累加的，用户手动刷新同一张结果页会多加一次；请评估用
+  「本次运行的 `state.search.done` + 已持久化的基线」替代，避免面板次数虚高。
+- `settleUnseen()` 把任务打回 `pending` 会重新排队，如果卡片只是当天不显示（例如活动结束但没标完成），
+  它会白白消耗 `maxAttemptsPerTask`。考虑加一个「连续两轮都没看到就判 skipped」的规则。
+- `nextQuery()` 的 `state.queryHistory` 只在 `start()` 时保留，跨天不重置但也不清理，跑一个月会顶到 400 条上限后
+  永久拒绝新查询候选；确认这条截断策略是否会造成查询重复。
 
-「必应搜索」区块是 v1.1.0 新加的，字段为：今日已获搜索积分 / 每日上限（`desktopTarget × pointsPerSearch`）、
-进度条、已完成 X/Y 次、每次搜索 +N 积分、还差 N 积分；打满后整块转绿并显示「今日搜索积分已满」。
+### P1 · 面板 UI（剩余）
 
-希望优化：
+1. **移动端实测**：`@media (max-width: 620px)` 下主卡已缩到 4.6rem 环形，但还没有在真机 360px 宽度下验证过折叠/展开的滚动。
+2. **打满态**：现在是「今日搜索积分已满 · 明天 0 点重置」，可以再考虑把主卡标题换成「今日搜索已完成」。
+3. **信息密度**：面板现在 508px 高，接近小屏上限；评估是否把「任务分段」并入「每日任务」块来省 40px。
+4. **数字动效**（可选）：积分变化时给大数字一个 200ms 的淡入位移，注意 `prefers-reduced-motion`。
 
-1. **信息层级**：脚本的主要价值是搜索积分，这块应该比「今日已获得积分」更容易一眼扫到。
-   考虑把它和 summary 合并成一张主卡（左边大数字＝搜索积分，右边小环形＝任务完成度），而不是两块并列。
-2. **运行中反馈**：搜索阶段让进度条有轻微的流动/呼吸动画（`prefers-reduced-motion` 下必须关闭），
-   并在底栏状态文字里显示「第 N 次搜索中」。
-3. **打满态**：除了变绿，加一行轻量说明（例如「明天 0 点重置」），不要用庆祝动画。
-4. **折叠态**：折叠后标题栏右侧显示 `45/90` 的迷你进度，不用展开就能看到搜索积分。
-5. **移动端**：`@media (max-width: 620px)` 下当前是整块贴底，检查内容是否超高、滚动是否顺手。
-6. **性能**：`refreshStats()` 每 5 秒调用 `scanCards()` + `document.body.innerText`，
-   在长列表页会反复触发 layout。请给出不牺牲准确性的降频或按需触发方案（例如只在 DOM 变化时重扫）。
-7. **可访问性**：进度条补 `role="progressbar"` + `aria-valuenow`，开关补 `aria-checked` 语义。
+### P2 · 可维护性（剩余）
 
-改进时必须保持：暗色玻璃拟态风格（`--panel` / `--line` / `--blue` / `--green` 变量）、24px 大圆角、
-不使用图片资源（图标全部内联 SVG）、文本全部中文。
+- `PANEL_CSS` 已接近 100 行且和 `index.html` 的设计稿开始漂移，考虑在 README 里注明「以脚本内为准」。
+- `publicState()` 用 JSON 深拷贝，日志里带 `at` 时间戳，事件高频时会有额外开销；确认 `emit` 频率是否需要节流。
 
-### P2 · 可维护性
+### P3 · 可选增强（先讨论，不要直接写）
 
-- 把 `rewardsStep()` 里「拼图页 / Rewards 站内页」两段几乎重复的分支抽成一个函数。
-- `TEXT_PATTERNS` 之外，把「已完成 / Completed」这类状态词也集中成常量。
-- 给 `state.phase` 的取值做个校验函数，避免拼错字符串后静默失效。
+- 运行结束写一条本地历史（`msr:history:v1`，只保留 30 天），面板上加「近 7 天搜索积分」小柱状图。
+- 支持导出 JSON 日志，方便排查某个任务为什么没给分。
+- 搜索查询池支持用户自定义（`configure({ queries: [...] })`）。
 
 ### P3 · 可选增强（先讨论，不要直接写）
 
@@ -112,7 +115,8 @@ React 站点的 DOM 逆向、Shadow DOM 样式隔离，以及「页面会随时�
 ## 已知坑（别重复踩）
 
 - Bing / Rewards 是 React 应用，卡片懒加载，直接 `querySelectorAll` 常常拿到空数组，要 `waitFor()`。
-- `innerText` 会强制 layout，5 秒一轮回的全量读取在长页面上很贵。
+- `innerText` 会强制 layout，面板轮询已经降到 10 秒且只读 `main` 区域，别再改回整页 5 秒。
 - 中英文界面文案不同，正则只写中文会在英文账号下全部失效（已修，别改回去）。
 - 桌面浏览器无法完成移动端搜索、Edge 浏览时长、Xbox / 桌面奖励应用类任务——这些只能跳过，不要尝试伪造 UA 或环境。
 - 拼图（`spotlight/imagepuzzle`）无法自动完成，只能记日志跳过。
+- 面板组件都在 Shadow DOM 里，MutationObserver 观察 `document.body` 看不到面板自身的改动，别用它去做「避免自触发」的假设。
