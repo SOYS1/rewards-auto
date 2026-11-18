@@ -1,14 +1,16 @@
 // ==UserScript==
-// @name         Microsoft Rewards 自动助手（核心）
-// @namespace    https://github.com/soys/ms-rewards-auto
-// @version      1.0.0
-// @description  Bing 搜索与 Rewards 每日任务自动化核心；不含 UI，面板可通过 window.MSRewards 事件接入
-// @author       soys
+// @name         Microsoft Rewards 自动助手
+// @namespace    https://github.com/SOYS1/rewards-auto
+// @version      1.1.0
+// @description  Bing 搜索与 Rewards 每日任务自动化，内置悬浮面板（搜索积分 / 每日任务 / 连续天数）
+// @author       SOYS1
 // @match        https://www.bing.com/*
 // @match        https://cn.bing.com/*
-// @match        https://*.bing.com/*
 // @match        https://rewards.bing.com/*
 // @icon         https://www.bing.com/favicon.ico
+// @updateURL    https://raw.githubusercontent.com/SOYS1/rewards-auto/main/ms-rewards-auto.user.js
+// @downloadURL  https://raw.githubusercontent.com/SOYS1/rewards-auto/main/ms-rewards-auto.user.js
+// @supportURL   https://github.com/SOYS1/rewards-auto/issues
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @run-at       document-idle
@@ -33,7 +35,7 @@
 
   /* ================= 常量与默认配置 ================= */
 
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
   const STATE_KEY = 'msr:state:v1';
   const SETTINGS_KEY = 'msr:settings:v1';
 
@@ -83,6 +85,7 @@
     searchEnabled: true,
     desktopTarget: 30,      // 每日 PC 搜索次数（各地区额度不同，按需调整）
     mobileTarget: 0,        // 移动端搜索需要移动 UA，脚本无法在桌面浏览器完成
+    pointsPerSearch: 3,     // 每次搜索发放的积分，用来换算「每日搜索积分上限」
     minDelayMs: 4500,       // 两次搜索之间的最小间隔
     maxDelayMs: 9000,       // 两次搜索之间的最大间隔
     // 每日任务
@@ -140,6 +143,35 @@
     if (!digits) return null;
     const value = parseInt(digits, 10);
     return Number.isFinite(value) ? value : null;
+  }
+
+  // Rewards 页面文案随账号语言变化，中英文模式都试一遍，避免非中文界面下统计全部失效。
+  const TEXT_PATTERNS = {
+    available: [
+      /可用积分\s*[:：]?\s*([\d,]+)/,
+      /available points\s*[:：]?\s*([\d,]+)/i,
+      /points? balance\s*[:：]?\s*([\d,]+)/i
+    ],
+    today: [
+      /今日积分\s*[:：]?\s*([\d,]+)/,
+      /today'?s points\s*[:：]?\s*([\d,]+)/i
+    ],
+    streak: [
+      /每日连续(?:打卡|记录)\s*[:：]?\s*([\d,]+)\s*天/,
+      /(\d+)\s*-?\s*day streak/i,
+      /day streak\s*[:：]?\s*([\d,]+)/i
+    ]
+  };
+
+  function matchPoints(text, patterns) {
+    const source = String(text || '');
+    for (const pattern of patterns) {
+      const match = source.match(pattern);
+      if (!match || match[1] == null) continue;
+      const value = parsePoints(match[1]);
+      if (value != null) return value;
+    }
+    return null;
   }
 
   function hash(text) {
@@ -221,14 +253,14 @@
       version: VERSION,
       running: false,
       stopRequested: false,
-      phase: 'idle',          // idle | daily | search | search-review | done | error
+      phase: 'idle',          // idle | daily | search | search-review | done | paused | error
       date: todayKey(),
       startedAt: 0,
       lastRunAt: 0,
       navCount: 0,
       search: emptySearch(),
       scanned: { dashboard: false, earn: false },
-      stats: { date: todayKey(), at: 0, today: null, total: null, streak: null, tasks: [] },
+      stats: { date: todayKey(), at: 0, today: null, total: null, streak: null, tasks: [], search: { gained: 0, count: 0 } },
       tasks: {},
       log: []
     };
@@ -241,6 +273,8 @@
     next.search = { ...base.search, ...((saved && saved.search) || {}) };
     next.scanned = { ...base.scanned, ...((saved && saved.scanned) || {}) };
     next.stats = { ...base.stats, ...((saved && saved.stats) || {}) };
+    next.stats.search = { ...base.stats.search, ...((saved && saved.stats && saved.stats.search) || {}) };
+    if (!Array.isArray(next.stats.tasks)) next.stats.tasks = [];
     next.tasks = (saved && saved.tasks) || {};
     next.log = (saved && saved.log) || [];
     // 跨天时清掉当天的任务与搜索进度，但保留运行中的会话。
@@ -559,13 +593,28 @@
   function readPoints() {
     try {
       if (isRewardsPage()) {
-        const match = (document.body.innerText || '').match(/可用积分\s*([\d,]+)/);
-        if (match) return parsePoints(match[1]);
+        const points = matchPoints(document.body && document.body.innerText, TEXT_PATTERNS.available);
+        if (points != null) return points;
       }
       const node = document.querySelector('#rh_rwm, #id_rc');
       if (node) return parsePoints(node.textContent);
     } catch { /* 忽略解析异常 */ }
     return null;
+  }
+
+  // 每日搜索积分上限 = 每日搜索次数 × 每次搜索积分，两者都可以在 configure 里改。
+  function searchCap() {
+    const target = Math.max(0, Number(settings.desktopTarget) || 0);
+    const perSearch = Math.max(0, Number(settings.pointsPerSearch) || 0);
+    return { target, perSearch, cap: target * perSearch };
+  }
+
+  // 搜索积分靠「结果页积分挂件差值」实测累计；返回 Rewards 后再用整段差值兜底。
+  function addSearchPoints(gain) {
+    const stats = state.stats;
+    if (!stats.search) stats.search = { gained: 0, count: 0 };
+    stats.search.count = (Number(stats.search.count) || 0) + 1;
+    if (gain > 0) stats.search.gained = (Number(stats.search.gained) || 0) + gain;
   }
 
   function nextSearch() {
@@ -592,9 +641,10 @@
 
     // Bing 的结果页右上角有积分挂件，用它判断「这次搜索是否真的加分」。
     const points = readPoints();
+    let gain = 0;
     if (points != null) {
       if (state.search.pointsLast != null) {
-        const gain = points - state.search.pointsLast;
+        gain = points - state.search.pointsLast;
         if (gain > 0) {
           state.search.stall = 0;
           log(`搜索加分 +${gain}，当前 ${points}`);
@@ -605,6 +655,7 @@
       state.search.pointsLast = points;
       if (state.search.pointsStart == null) state.search.pointsStart = points;
     }
+    addSearchPoints(gain);
     persist();
     emit('change', { phase: state.phase, search: state.search });
 
@@ -628,6 +679,11 @@
     if (points != null) {
       const gained = state.search.pointsStart == null ? 0 : points - state.search.pointsStart;
       log(`本次共搜索 ${state.search.done} 次，积分 ${state.search.pointsStart ?? '-'} → ${points}（+${Math.max(gained, 0)}）`);
+      // 逐次累加会漏掉第一次搜索，用整段差值兜底（只取更大的那个）。
+      if (gained > 0) {
+        const stats = state.stats.search || (state.stats.search = { gained: 0, count: 0 });
+        stats.gained = Math.max(Number(stats.gained) || 0, gained);
+      }
     }
     state.phase = 'done';
     return finish('搜索额度已完成');
@@ -635,7 +691,24 @@
 
   /* ================= 导航 / 阶段推进 ================= */
 
+  // 跳转前的最后一道校验：只放行白名单域名与 https，且绝不进入兑换 / 抽奖 / 账号页。
+  function navigationTarget(raw) {
+    let url;
+    try {
+      url = new URL(raw, location.href);
+    } catch {
+      return null;
+    }
+    if (url.protocol !== 'https:') return null;
+    if (!TASK_HOSTS.includes(url.hostname)) return null;
+    if (/\/(redeem|sweeps)(\/|$)/.test(url.pathname)) return null;
+    if (/^\/(account|profile|preferences|signin|login)/i.test(url.pathname)) return null;
+    return url;
+  }
+
   function go(url, options = {}) {
+    const target = navigationTarget(url);
+    if (!target) return finish('目标地址不在白名单内，已中止：' + url, 'error');
     const delay = options.delay == null ? rand(900, 1800) : options.delay;
     state.navCount = (state.navCount || 0) + 1;
     persist();
@@ -643,7 +716,7 @@
     return sleep(delay).then(() => {
       // 用户可能在等待期间点了停止，此时不再跳转。
       if (!state.running) return;
-      location.assign(url);
+      location.assign(target.href);
     });
   }
 
@@ -762,7 +835,7 @@
 
     const runtime = Date.now() - state.startedAt;
     if (runtime > (Number(settings.maxRuntimeMin) || 45) * 60 * 1000) {
-      return finish('超过单次运行时限', 'error');
+      return finish('超过单次运行时限', 'warn');
     }
 
     // 每日任务可能把页面带到 msn.com / microsoft.com 等站点，
@@ -922,6 +995,21 @@
     .ring-center strong, .ring-center span { display: block; }
     .ring-center strong { font-size: 1.25rem; line-height: 1; }
     .ring-center span { margin-top: .22rem; color: var(--muted); font-size: .62rem; }
+    .search-card { margin: 0 1rem 1rem; padding: .82rem .85rem .78rem; border: 1px solid rgba(94, 185, 255, .26); border-radius: 15px; background: linear-gradient(150deg, rgba(39, 137, 232, .18), rgba(94, 185, 255, .03)); }
+    .search-head { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+    .search-title { display: flex; align-items: center; gap: .35rem; font-size: .75rem; font-weight: 600; color: #dbeaff; }
+    .search-title svg { width: .85rem; height: .85rem; color: var(--blue); }
+    .search-cap { color: var(--muted); font-size: .66rem; white-space: nowrap; }
+    .search-value { display: flex; align-items: baseline; gap: .3rem; margin: .42rem 0 .5rem; }
+    .search-value strong { font-size: 1.5rem; line-height: 1; letter-spacing: -.03em; }
+    .search-value em { color: var(--muted); font-size: .75rem; font-style: normal; }
+    .search-bar { height: .38rem; overflow: hidden; border-radius: 99px; background: rgba(126, 162, 202, .16); }
+    .search-bar i { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--blue-strong), var(--blue)); transition: width .35s ease; }
+    .search-card.is-complete { border-color: rgba(109, 225, 177, .32); background: linear-gradient(150deg, rgba(53, 169, 127, .18), rgba(109, 225, 177, .03)); }
+    .search-card.is-complete .search-bar i { background: linear-gradient(90deg, #35a97f, var(--green)); }
+    .search-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .2rem .6rem; margin-top: .45rem; color: var(--muted); font-size: .66rem; }
+    .search-meta .search-remain { color: var(--blue); }
+    .search-card.is-complete .search-meta .search-remain { color: var(--green); }
     .task-segments { padding: 0 1rem 1rem; }
     .task-segments-title { display: flex; justify-content: space-between; margin-bottom: .42rem; color: var(--muted); font-size: .68rem; }
     .segment-track { display: grid; grid-template-columns: repeat(6, 1fr); gap: .3rem; min-height: .35rem; }
@@ -995,6 +1083,24 @@
             <div class="ring-center"><strong id="progressText">--</strong><span>每日任务</span></div>
           </div>
         </section>
+        <section class="search-card" id="searchCard">
+          <div class="search-head">
+            <span class="search-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></svg>必应搜索
+            </span>
+            <span class="search-cap" id="searchCapLabel">每日上限 -- 积分</span>
+          </div>
+          <div class="search-value">
+            <strong id="searchPoints">+0</strong>
+            <em id="searchCapValue">/ --</em>
+          </div>
+          <div class="search-bar"><i id="searchBar"></i></div>
+          <div class="search-meta">
+            <span id="searchCount">已完成 0 次</span>
+            <span id="searchRate">每次搜索 +3 积分</span>
+            <span class="search-remain" id="searchRemain"></span>
+          </div>
+        </section>
         <section class="task-segments">
           <div class="task-segments-title"><span>任务分段</span><span id="taskCount">等待扫描</span></div>
           <div class="segment-track" id="segmentTrack"></div>
@@ -1045,24 +1151,22 @@
     if (persistValue) savePanelPrefs({ position: { left: clampedLeft, top: clampedTop } });
   }
 
-  function parseMatch(text, pattern) {
-    const match = String(text).match(pattern);
-    return match ? parsePoints(match[1]) : null;
-  }
-
   // 读取面板数据：Rewards 页面解析文字，Bing 页面只更新总积分。
   function refreshStats(force = false) {
     let stats = { ...(state.stats || {}) };
-    if (stats.date !== todayKey()) {
-      stats = { date: todayKey(), at: 0, today: null, total: stats.total || null, streak: null, tasks: [] };
-    }
     let changed = false;
+    if (stats.date !== todayKey()) {
+      // 跨天时整块重置（含搜索积分），并把签名一起清掉，否则同名的卡片会被判为「没变化」。
+      stats = { ...createState().stats, total: stats.total ?? null };
+      statsSignature = '';
+      changed = true;
+    }
 
     if (isRewardsPage()) {
-      const text = document.body?.innerText || '';
-      const today = parseMatch(text, /今日积分\s*([\d,]+)/);
-      const total = parseMatch(text, /可用积分\s*([\d,]+)/);
-      const streak = parseMatch(text, /每日连续(?:打卡|记录)\s*([\d,]+)\s*天/);
+      const text = (document.body && document.body.innerText) || '';
+      const today = matchPoints(text, TEXT_PATTERNS.today);
+      const total = matchPoints(text, TEXT_PATTERNS.available);
+      const streak = matchPoints(text, TEXT_PATTERNS.streak);
       if (today != null && today !== stats.today) { stats.today = today; changed = true; }
       if (total != null && total !== stats.total) { stats.total = total; changed = true; }
       if (streak != null && streak !== stats.streak) { stats.streak = streak; changed = true; }
@@ -1129,6 +1233,25 @@
     $('#deltaText').textContent = stats.at
       ? '更新于 ' + new Date(stats.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
       : '等待 Rewards 数据';
+
+    // 必应搜索：今日已获搜索积分 / 每日搜索积分上限（次数 × 每次积分）。
+    const { target, perSearch, cap } = searchCap();
+    const searchStats = stats.search || { gained: 0, count: 0 };
+    const searchGained = Math.max(0, Number(searchStats.gained) || 0);
+    const searchShown = cap > 0 ? Math.min(searchGained, cap) : searchGained;
+    const searchDone = Math.max(0, Number(searchStats.count) || 0);
+    $('#searchPoints').textContent = '+' + searchShown;
+    $('#searchCapValue').textContent = cap > 0 ? '/ ' + cap : '/ --';
+    $('#searchCapLabel').textContent = cap > 0 ? '每日上限 ' + cap + ' 积分' : '每日上限未设置';
+    $('#searchBar').style.width = cap > 0 ? Math.round((searchShown / cap) * 100) + '%' : '0%';
+    $('#searchRate').textContent = perSearch > 0 ? '每次搜索 +' + perSearch + ' 积分' : '每次搜索积分未设置';
+    $('#searchCount').textContent = target > 0
+      ? '已完成 ' + Math.min(searchDone, target) + '/' + target + ' 次'
+      : '已完成 ' + searchDone + ' 次';
+    $('#searchRemain').textContent = cap <= 0
+      ? ''
+      : (searchShown >= cap ? '今日搜索积分已满' : '还差 ' + (cap - searchShown) + ' 积分');
+    $('#searchCard').classList.toggle('is-complete', cap > 0 && searchShown >= cap);
 
     const ringValue = $('#ringValue');
     ringValue.style.strokeDasharray = '100';
